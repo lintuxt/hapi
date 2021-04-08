@@ -2,20 +2,23 @@
 
 const ChildProcess = require('child_process');
 const Fs = require('fs');
+const Http = require('http');
+const Net = require('net');
 const Path = require('path');
 const Stream = require('stream');
 const Zlib = require('zlib');
 
 const Boom = require('@hapi/boom');
-const Bounce = require('@hapi/bounce');
 const Code = require('@hapi/code');
 const Hapi = require('..');
 const Hoek = require('@hapi/hoek');
 const Inert = require('@hapi/inert');
 const Lab = require('@hapi/lab');
+const LegacyReadableStream = require('legacy-readable-stream');
 const Teamwork = require('@hapi/teamwork');
 const Wreck = require('@hapi/wreck');
 
+const Common = require('./common');
 
 const internals = {};
 
@@ -85,7 +88,7 @@ describe('transmission', () => {
             expect(res.statusCode).to.equal(200);
         });
 
-        it('closes file handlers when not reading file stream', { skip: process.platform === 'win32' }, async () => {
+        it('closes file handlers when not reading file stream', { skip: !Common.hasLsof }, async () => {
 
             const server = Hapi.server();
             await server.register(Inert);
@@ -99,12 +102,6 @@ describe('transmission', () => {
 
                 const cmd = ChildProcess.spawn('lsof', ['-p', process.pid]);
                 let lsof = '';
-
-                cmd.on('error', (err) => {
-
-                    // Allow the test to pass on platforms with no lsof
-                    Bounce.ignore(err, { errno: 'ENOENT' });
-                });
 
                 cmd.stdout.on('data', (buffer) => {
 
@@ -127,7 +124,7 @@ describe('transmission', () => {
             });
         });
 
-        it('closes file handlers when not using a manually open file stream', { skip: process.platform === 'win32' }, async () => {
+        it('closes file handlers when not using a manually open file stream', { skip: !Common.hasLsof }, async () => {
 
             const server = Hapi.server();
             server.route({ method: 'GET', path: '/file', handler: (request, h) => h.response(Fs.createReadStream(__dirname + '/../package.json')).header('etag', 'abc') });
@@ -140,12 +137,6 @@ describe('transmission', () => {
 
                 const cmd = ChildProcess.spawn('lsof', ['-p', process.pid]);
                 let lsof = '';
-
-                cmd.on('error', (err) => {
-
-                    // Allow the test to pass on platforms with no lsof
-                    Bounce.ignore(err, { errno: 'ENOENT' });
-                });
 
                 cmd.stdout.on('data', (buffer) => {
 
@@ -531,6 +522,52 @@ describe('transmission', () => {
             expect(res.statusCode).to.equal(200);
             expect(res.headers['cache-control']).to.be.undefined();
         });
+
+        it('does not crash when request is aborted', async () => {
+
+            const server = Hapi.server();
+            server.route({ method: 'GET', path: '/', handler: () => 'ok' });
+
+            const team = new Teamwork.Team();
+            const onRequest = (request, h) => {
+
+                request.events.once('disconnect', () => team.attend());
+                return h.continue;
+            };
+
+            server.ext('onRequest', onRequest);
+
+            // Use state autoValue function to intercept marshal stage
+
+            server.state('always', {
+                async autoValue(request) {
+
+                    const close = new Teamwork.Team();
+                    request.raw.res.once('close', () => close.attend());
+
+                    // Will trigger abort then close. Prior to node v15.7.0 the res close came
+                    // asynchronously after req abort, but since then it comes in the same tick.
+                    client.destroy();
+                    await close.work;
+
+                    return team.work;               // Continue marshalling once the request has been aborted and response closed.
+                }
+            });
+
+            await server.start();
+
+            const log = server.events.once('response');
+            const client = Net.connect(server.info.port, () => {
+
+                client.write('GET / HTTP/1.1\r\n\r\n');
+            });
+
+            const [request] = await log;
+            expect(request.response.isBoom).to.be.true();
+            expect(request.response.output.statusCode).to.equal(499);
+            expect(request.info.completed).to.be.above(0);
+            expect(request.info.responded).to.equal(0);
+        });
     });
 
     describe('transmit()', () => {
@@ -685,7 +722,11 @@ describe('transmission', () => {
 
             const res = await server.inject('/');
             expect(res.statusCode).to.equal(500);
+            expect(res.statusMessage).to.equal('Internal Server Error');
             expect(res.result.message).to.equal('An internal server error occurred');
+            expect(res.raw.res.statusCode).to.equal(200);
+            expect(res.raw.res.statusMessage).to.equal('OK');
+            expect(res.rawPayload.toString()).to.equal('success');
 
             const [request] = await log;
             expect(request.response.statusCode).to.equal(500);
@@ -707,7 +748,7 @@ describe('transmission', () => {
                     this.isDone = true;
 
                     this.push('something');
-                    this.emit('error', new Error());
+                    setImmediate(() => this.emit('error', new Error()));
                 };
 
                 return stream;
@@ -718,10 +759,11 @@ describe('transmission', () => {
             server.route({ method: 'GET', path: '/', handler });
 
             await server.start();
-            await expect(Wreck.request('GET', 'http://localhost:' + server.info.port + '/')).to.reject();
+            const err = await expect(Wreck.get('http://localhost:' + server.info.port + '/')).to.reject();
             await server.stop();
 
             const [request] = await log;
+            expect(err.data.res.statusCode).to.equal(200);
             expect(request.response.statusCode).to.equal(500);
             expect(request.info.completed).to.be.above(0);
             expect(request.info.responded).to.equal(0);
@@ -1183,6 +1225,10 @@ describe('transmission', () => {
 
             const res = await server.inject({ url: '/stream', headers: { 'Accept-Encoding': 'gzip' } });
             expect(res.statusCode).to.equal(499);
+            expect(res.statusMessage).to.equal('Unknown');
+            expect(res.raw.res.statusCode).to.equal(204);
+            expect(res.raw.res.statusMessage).to.equal('No Content');
+            expect(res.rawPayload.toString()).to.equal('here is the response');
 
             const [request] = await log;
             expect(request.response.statusCode).to.equal(499);
@@ -1273,56 +1319,28 @@ describe('transmission', () => {
             await server.stop();
         });
 
-        it('does not leak classic stream data when passed to request and aborted', async () => {
+        it('destroy() stream when request aborts before stream drains', async () => {
 
-            const server = Hapi.server({ debug: false });
+            const server = Hapi.server();
 
-            let destroyed = false;
             const team = new Teamwork.Team();
             const handler = (request) => {
 
-                const stream = new Stream();
-                stream.readable = true;
+                return new Stream.Readable({
+                    read(size) {
 
-                let paused = true;
-                const _read = function () {
+                        const chunk = new Array(size).join('x');
 
-                    setImmediate(() => {
+                        setTimeout(() => {
 
-                        if (paused) {
-                            return;
-                        }
+                            this.push(chunk);
+                        }, 10);
+                    },
+                    destroy() {
 
-                        const chunk = new Array(1024).join('x');
-
-                        if (destroyed) {
-                            stream.emit('data', chunk);
-                            stream.readable = false;
-                            stream.emit('end');
-                        }
-                        else {
-                            stream.emit('data', chunk);
-                            _read();
-                        }
-                    });
-                };
-
-                stream.resume = function () {
-
-                    if (paused) {
-                        paused = false;
-                        _read();
+                        team.attend();
                     }
-                };
-
-                stream.pause = function () {
-
-                    paused = true;
-                };
-
-                stream.resume();
-                stream.once('end', team.attend());
-                return stream;
+                });
             };
 
             server.route({ method: 'GET', path: '/', handler });
@@ -1330,43 +1348,47 @@ describe('transmission', () => {
             await server.start();
 
             const res = await Wreck.request('GET', 'http://localhost:' + server.info.port);
-            res.on('data', (chunk) => {
+            res.once('data', (chunk) => {
 
-                if (!destroyed) {
-                    destroyed = true;
-                    res.destroy();
-                }
+                res.destroy();
             });
 
+            await team.work;
             await server.stop();
+
+            expect(res.statusCode).to.equal(200);
         });
 
-        it('does not leak stream data when request timeouts before stream drains', async () => {
+        it('destroy() stream when request timeouts before stream drains', async () => {
 
             const server = Hapi.server({ routes: { timeout: { server: 20, socket: 40 }, payload: { timeout: false } } });
             const team = new Teamwork.Team();
 
             const handler = (request) => {
 
-                const stream = new Stream.Readable();
                 let count = 0;
-                stream._read = function (size) {
+                const stream = new Stream.Readable({
+                    read(size) {
 
-                    const timeout = 10 * count++;           // Must have back off here to hit the socket timeout
+                        const timeout = 10 * count++;           // Must have back off here to hit the socket timeout
 
-                    setTimeout(() => {
+                        setTimeout(() => {
 
-                        if (request._isFinalized) {
-                            stream.push(null);
-                            return;
-                        }
+                            if (request._isFinalized) {
+                                stream.push(null);
+                                return;
+                            }
 
-                        stream.push(new Array(size).join('x'));
+                            stream.push(new Array(size).join('x'));
 
-                    }, timeout);
-                };
+                        }, timeout);
+                    },
+                    destroy() {
 
-                stream.once('close', () => team.attend());
+                        team.attend();
+                    }
+                });
+
                 return stream;
             };
 
@@ -1379,6 +1401,132 @@ describe('transmission', () => {
 
             await team.work;
             await server.stop();
+
+            expect(res.statusCode).to.equal(200);
+        });
+
+        it('destroy() stream when request aborts before stream drains', async () => {
+
+            const server = Hapi.server();
+
+            const team = new Teamwork.Team();
+            const handler = async (request) => {
+
+                clientRequest.abort();
+
+                const stream = new Stream.Readable({
+                    read(size) {
+
+                        const chunk = new Array(size).join('x');
+
+                        setTimeout(() => {
+
+                            this.push(chunk);
+                        }, 10);
+                    },
+                    destroy() {
+
+                        team.attend();
+                    }
+                });
+
+                await Hoek.wait(100);
+                return stream;
+            };
+
+            server.route({ method: 'GET', path: '/', handler });
+
+            await server.start();
+
+            const clientRequest = Http.request({
+                hostname: 'localhost',
+                port: server.info.port,
+                method: 'GET'
+            });
+
+            clientRequest.on('error', Hoek.ignore);
+            clientRequest.end();
+
+            await team.work;
+            await server.stop();
+        });
+
+        it('close() stream when no destroy() method', async () => {
+
+            const server = Hapi.server();
+
+            const team = new Teamwork.Team();
+            const handler = (request) => {
+
+                const stream = new LegacyReadableStream.Readable();
+                stream._read = function (size) {
+
+                    const chunk = new Array(size).join('x');
+
+                    setTimeout(() => {
+
+                        this.push(chunk);
+                    }, 10);
+                };
+
+                stream.close = () => team.attend();
+
+                return stream;
+            };
+
+            server.route({ method: 'GET', path: '/', handler });
+
+            await server.start();
+
+            const res = await Wreck.request('GET', 'http://localhost:' + server.info.port);
+            res.once('data', (chunk) => {
+
+                res.destroy();
+            });
+
+            await team.work;
+            await server.stop();
+
+            expect(res.statusCode).to.equal(200);
+        });
+
+        it('unpipe() stream when no destroy() or close() method', async () => {
+
+            const server = Hapi.server();
+
+            const team = new Teamwork.Team();
+            const handler = (request) => {
+
+                const stream = new LegacyReadableStream.Readable();
+                stream._read = function (size) {
+
+                    const chunk = new Array(size).join('x');
+
+                    setTimeout(() => {
+
+                        this.push(chunk);
+                    }, 10);
+                };
+
+                stream.unpipe = () => team.attend();
+
+                return stream;
+            };
+
+            server.route({ method: 'GET', path: '/', handler });
+
+            await server.start();
+
+            const res = await Wreck.request('GET', 'http://localhost:' + server.info.port);
+            res.once('data', (chunk) => {
+
+                res.destroy();
+            });
+
+            await team.work;
+            await server.stop();
+
+            expect(res.statusCode).to.equal(200);
         });
 
         it('changes etag when content-encoding set manually', async () => {
